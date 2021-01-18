@@ -1,0 +1,171 @@
+//Using the geometry inputs in the map frame, 
+//Please specify a rectangular geometry
+Map.centerObject(geometry)
+
+//Please specify a date below in the format 'YYYY-MM-DD'
+//If this date does not coincide with an image acqusition, 
+//Search the first print message in the console 
+//("Potential S1 Images)" and select the closest available 
+//date from that list with dual polarization
+var date = ee.Algorithms.Date('2019-04-11')
+
+//Validation data table that must be specified. Choose table with same date as above. 
+//Files follow the naming scheme YYYYMMDD. 
+//Data uploaded from source: https://www.glerl.noaa.gov/data/ice/#historical
+var table3 = ee.FeatureCollection("users/marcacciojv/GLIceShapefiles/20190411")
+//Must also rename column, which follows format of 'gYYYYMMDD', e.g. g20190105
+var table3 = table3.map(function(feat){
+  return ee.Feature(feat.geometry(), { 
+    iceconc: feat.get('g20190411'),
+    id: feat.get('Feature Index')
+  })
+})
+// If access is not granted to the above, you can download the data from the source
+//link and upload it into your own repo. The script will work with line 15
+//modified to your own asset repo. 
+//
+//Note that regardless of the input band types, they will be renamed VV and VH
+//though this method is accurate for both polarizations. Please be aware
+// of this when using the outputs!! 
+//
+//If the image is not dual polarized it will be rejected as these are
+// unreliable for this methodology. 
+//That's it! Happy coastal ice mapping. 
+
+
+////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+/////                                                                     /////
+/////                   ***End of Inputs***                              /////
+/////                                                                     /////
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+
+
+// Function to perform angle correction
+var angleCor = function toGamma0(image) {
+ var hv = image.select('VH').subtract(image.select('angle')
+ .multiply(Math.PI/180.0).cos().log10().multiply(10.0));
+ return hv.addBands(image.select('VV').subtract(image.select('angle')
+ .multiply(Math.PI/180.0).cos().log10().multiply(10.0)));
+}
+//Sentinel-1 Image Collection
+var s1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+
+
+//Expand date search to Sentinel-1 image acqusition time, i.e. 10 days
+var dateStart = ee.Date(date).advance(-5, 'day')
+var dateEnd = ee.Date(date).advance(5, 'day')
+//Print a list of Sentinel-1 images closest to your chosen date
+var potential = s1.filterBounds(geometry).filterDate(dateStart, dateEnd)
+print('Potential S1 Images', potential.filterDate(dateStart, dateEnd))
+
+//One of two variable that must be specified. Choose the same date as the input table below
+var s3march16 = s1.filterBounds(geometry).filterDate(date, date.advance(1, 'day')).map(angleCor)
+print('Selected S1 Image', s3march16)
+Map.addLayer(s3march16)
+
+//var s1ce = s3march16.toBands()
+var s1ce1 = s3march16.toBands().rename(['VV', 'VH'])
+print('Checking that there is an image...', s1ce1)
+
+
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(9);
+
+var snic = ee.Algorithms.Image.Segmentation.SNIC({
+  image: s1ce1,
+  compactness:2,
+  connectivity:8,
+  seeds:seeds
+});
+
+var clusters = snic.select('clusters');
+Map.addLayer(clusters.randomVisualizer(), {}, 'clusters', false)
+//print(clusters);
+var stdDev = s1ce1.addBands(clusters).reduceConnectedComponents(ee.Reducer.stdDev(), 'clusters', 256);
+Map.addLayer(stdDev, {min:0, max:0.1}, 'StdDev', false);
+//print(stdDev);
+var area = ee.Image.pixelArea().addBands(clusters).reduceConnectedComponents(ee.Reducer.sum(), 'clusters', 256);
+Map.addLayer(area, {min:10, max: 500000}, 'Cluster Area', false);
+//print(area);
+
+
+var objectPropertiesImage = ee.Image.cat([
+  snic/*.select(bands)*/,
+  stdDev,
+  area,
+]).float();
+
+
+//with image object properties
+var trainingObj = objectPropertiesImage.sampleRegions({collection: table3, properties: ['iceconc'], scale: 20});
+
+// The randomColumn() method will add a column of uniform random
+// numbers in a column named 'random' by default.
+trainingObj = trainingObj.randomColumn();
+
+//Splitting for training vs validation
+var split = 0.7;  // Roughly 70% training, 30% testing.
+var trainingObjr = trainingObj.filter(ee.Filter.lt('random', split));
+//print(trainingObj.size());
+var validationObj = trainingObj.filter(ee.Filter.gte('random', split));
+
+//Applying the classifier
+var classifierObj = ee.Classifier.smileRandomForest(100).train(trainingObjr, 'iceconc', ['VV_mean', 'VH_mean']);
+var classifiedObj = objectPropertiesImage.classify(classifierObj);
+Map.addLayer(classifiedObj, {min:0, max:100}, 'classification Objects')
+
+Export.image.toDrive({
+  image: classifiedObj,
+  description: 'IceExport',
+  folder: 'Ice_RSTrain',
+  fileNamePrefix: 'Ice',
+  region: geometry,
+  scale: 20
+  
+})
+
+//Training accuracy: Error matrix and absolute number
+var trainAccuracy = classifierObj.confusionMatrix();
+print('Ice Resubstitution error matrix: ', trainAccuracy);
+print('Ice Training overall accuracy: ', trainAccuracy.accuracy());
+
+
+//Same for held back Validation Dataset
+var validaterObj = ee.Classifier.smileRandomForest(100).train(validationObj, 'iceconc', ['VV_mean', 'VH_mean']);
+var validatedObj = objectPropertiesImage.classify(validaterObj);
+var validaterAccuracy = validaterObj.confusionMatrix();
+print('Ice Validation error matrix: ', validaterAccuracy);
+print('Ice Validation overall accuracy: ', validaterAccuracy.accuracy());
+
+//Converting confusion matrix to feature collection for export:
+var exportAccuracy = ee.Feature(null, {matrix: trainAccuracy.array()});
+var exportValidation = ee.Feature(null, {matrix: validaterAccuracy.array()});
+
+//Creating a file with just accuracy, producer accuracy, and consumer accuracy
+var exportValidNums = ee.FeatureCollection([ee.Feature(null,{
+  'overall accuracy': validaterAccuracy.accuracy(), 
+  'producer accuracy': validaterAccuracy.producersAccuracy(), 
+  'consumer accuracy': validaterAccuracy.consumersAccuracy()
+})]);
+
+Export.table.toDrive({
+  collection: exportValidNums,
+  description: 'IceNums',
+  folder: 'Ice_Acc',
+  fileNamePrefix: 'IceValidNums'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(exportAccuracy),
+  description: 'IceAcc',
+  folder: 'Ice_Acc',
+  fileNamePrefix: 'IceAcc'
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(exportValidation),
+  description: 'IceValid',
+  folder: 'Ice_Acc',
+  fileNamePrefix: 'IceValid'
+});
