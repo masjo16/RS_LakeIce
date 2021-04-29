@@ -1,25 +1,21 @@
+//////////   Step 1   //////////
 //Using the geometry inputs in the map frame, 
 //Please specify a rectangular geometry
-Map.centerObject(geometry)
 
-//Please specify a date below in the format 'YYYY-MM-DD'
+//////////   Step 2   //////////
+//Please specify a date below in the format YYYY, MM, DD
+//Be sure to include parentheses around your numbers, e.g. '11'
+//And also include '0' in front of numbers with only a single 
+//digit, e.g. '04'
 //If this date does not coincide with an image acqusition, 
 //Search the first print message in the console 
 //("Potential S1 Images)" and select the closest available 
 //date from that list with dual polarization
-var date = ee.Algorithms.Date('2019-04-11')
+var year = ('2019')
+var month = ('01')
+var day = ('03')
 
-//Validation data table that must be specified. Choose table with same date as above. 
-//Files follow the naming scheme YYYYMMDD. 
-//Data uploaded from source: https://www.glerl.noaa.gov/data/ice/#historical
-var table3 = ee.FeatureCollection("users/marcacciojv/GLIceShapefiles/20190411")
-//Must also rename column, which follows format of 'gYYYYMMDD', e.g. g20190105
-var table3 = table3.map(function(feat){
-  return ee.Feature(feat.geometry(), { 
-    iceconc: feat.get('g20190411'),
-    id: feat.get('Feature Index')
-  })
-})
+
 // If access is not granted to the above, you can download the data from the source
 //link and upload it into your own repo. The script will work with line 15
 //modified to your own asset repo. 
@@ -40,6 +36,29 @@ var table3 = table3.map(function(feat){
 /////                                                                     /////
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
+
+Map.centerObject(geometry)
+
+var yearMonth = (year+'-'+month)
+var doy = (yearMonth+'-'+day)
+var date = ee.Algorithms.Date(doy)
+var gdoy = ('g'+year+month+day)
+var datedash = (year+month+day)
+
+//Validation data table that must be specified.
+//Data uploaded from source: https://www.glerl.noaa.gov/data/ice/#historical
+var table3 = ee.FeatureCollection("users/marcacciojv/GLIceShapefiles/"+datedash)
+//Must also rename column, which follows format of 'gYYYYMMDD', e.g. g20190105
+/*
+var table3 = table3.map(function(feat){
+  return ee.Feature(feat.geometry(), { 
+    iceconc: feat.get(gdoy),
+    id: feat.get('Feature Index')
+  })
+})
+*/
+//Changing the data to no-ice, low-ice, and medium-ice, high-ice, full-ice
+var table3 = table3.remap([0,10,20,30,40,50,60,70,80,90,95,100],[0,0,0,40,40,40,70,70,70,100,100,100], "iceconc")
 
 
 // Function to perform angle correction
@@ -95,14 +114,45 @@ var objectPropertiesImage = ee.Image.cat([
   stdDev,
   area,
 ]).float();
+//New addition to create image out of feature collection
+//var table3img = table3.reduceToImage(['iceconc'], ee.Reducer.firstNonNull)//.toInt()
+//now stratified sampling so no class has over 100 points
+//var table3strat = table3img.stratifiedSample({numPoints: 100, classBand: 'iceconc', region: s1ce1.geometry, scale: 20})
 
+//a different way:
+// Creating Class Image
+var classes = ee.Image().byte().paint(table3, "iceconc").rename("iceconc").toUint8();
+//Thought maybe this would work better since we are combining with a float later
+//var classes = ee.Image().float().paint(table3, "iceconc").rename("iceconc").toUint8();
+// concatenate with objectPropertiesImage
+var classesImage = ee.Image.cat([objectPropertiesImage, classes])
+
+// Sampling from Class Image - Returns FeatureCollections
+
+var stratified = classesImage.addBands(ee.Image.pixelLonLat())
+    .stratifiedSample({
+      numPoints: 100, // This will be overridden by ClassValues & ClassPoints 
+      classBand: 'iceconc',
+      projection: 'EPSG:3857',//left is web mercator, right is NAD83 UTM 17N'EPSG:26917',
+      scale: 20,
+      region: s1ce1.geometry(),
+      classValues: [0,40,70,100],//[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100],
+      classPoints: [750,400,400,400]//[200, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]
+    }).map(function(f) {
+      return f.setGeometry(ee.Geometry.Point([f.get('longitude'), f.get('latitude')]));
+    });
+
+print(stratified);
 
 //with image object properties
 var trainingObj = objectPropertiesImage.sampleRegions({collection: table3, properties: ['iceconc'], scale: 20});
 
+
+
+
 // The randomColumn() method will add a column of uniform random
 // numbers in a column named 'random' by default.
-trainingObj = trainingObj.randomColumn();
+trainingObj = stratified.randomColumn();
 
 //Splitting for training vs validation
 var split = 0.7;  // Roughly 70% training, 30% testing.
@@ -113,13 +163,13 @@ var validationObj = trainingObj.filter(ee.Filter.gte('random', split));
 //Applying the classifier
 var classifierObj = ee.Classifier.smileRandomForest(100).train(trainingObjr, 'iceconc', ['VV_mean', 'VH_mean']);
 var classifiedObj = objectPropertiesImage.classify(classifierObj);
-Map.addLayer(classifiedObj, {min:0, max:100}, 'classification Objects')
+Map.addLayer(classifiedObj, {min:0, max:40}, 'classification Objects')
 
 Export.image.toDrive({
   image: classifiedObj,
-  description: 'IceExport',
-  folder: 'Ice_RSTrain',
-  fileNamePrefix: 'Ice',
+  description: 'IceExport'+datedash,
+  folder: 'Ice_RSTrain_Revis_3c',
+  fileNamePrefix: 'Ice'+datedash,
   region: geometry,
   scale: 20
   
@@ -151,21 +201,21 @@ var exportValidNums = ee.FeatureCollection([ee.Feature(null,{
 
 Export.table.toDrive({
   collection: exportValidNums,
-  description: 'IceNums',
-  folder: 'Ice_Acc',
-  fileNamePrefix: 'IceValidNums'
+  description: 'IceNums'+datedash,
+  folder: 'Ice_Acc_Revis4_3c',
+  fileNamePrefix: 'IceValidNums'+datedash
 });
 
 Export.table.toDrive({
   collection: ee.FeatureCollection(exportAccuracy),
-  description: 'IceAcc',
-  folder: 'Ice_Acc',
-  fileNamePrefix: 'IceAcc'
+  description: 'IceAcc'+datedash,
+  folder: 'Ice_Acc_Revis_3c',
+  fileNamePrefix: 'IceAcc'+datedash
 });
 
 Export.table.toDrive({
   collection: ee.FeatureCollection(exportValidation),
-  description: 'IceValid',
-  folder: 'Ice_Acc',
-  fileNamePrefix: 'IceValid'
+  description: 'IceValid'+datedash,
+  folder: 'Ice_Acc_Revis_3x',
+  fileNamePrefix: 'IceValid'+datedash
 });
